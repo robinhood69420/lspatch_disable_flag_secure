@@ -6,17 +6,26 @@ on:
       app_id:
         description: "Android app package (e.g. com.instagram.android or com.app@version)"
         required: false
+        type: string
 
       apk_url:
         description: "Direct APK download link (only if you don't use package name)"
         required: false
+        type: string
 
       download_source:
         description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
         required: false
+        default: "apk-pure"
+        type: choice
+        options:
+          - "apk-pure"
+          - "f-droid"
+          - "huawei-app-gallery"
 
-      signture_bypass:
-        description: "Signature bypass level (increase if apk has protection) [default: 0]"
+      signature_bypass:
+        description: "Signature bypass level [default: 0]"
+        required: false
         default: "0"
         type: choice
         options:
@@ -26,6 +35,7 @@ on:
 
       injectdex:
         description: "Inject dex directly (useful if apk is browser)"
+        required: false
         default: "false"
         type: choice
         options:
@@ -41,97 +51,329 @@ jobs:
         uses: actions/setup-java@v5.2.0
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: "21"
 
       - name: Build
+        shell: bash
         run: |
           set -euxo pipefail
+
+          echo "========================================"
+          echo "Input parameters"
+          echo "========================================"
 
           echo "app_id=${{ github.event.inputs.app_id }}"
           echo "apk_url=${{ github.event.inputs.apk_url }}"
           echo "download_source=${{ github.event.inputs.download_source }}"
-          echo "signture_bypass=${{ github.event.inputs.signture_bypass }}"
+          echo "signature_bypass=${{ github.event.inputs.signature_bypass }}"
           echo "injectdex=${{ github.event.inputs.injectdex }}"
 
           BASENAME="patched"
 
-          LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '.assets[] | select(.name=="lspatch.jar") | .browser_download_url')
+          # ==========================================================
+          # Download current LSPatch release
+          # ==========================================================
+          echo "========================================"
+          echo "Downloading LSPatch"
+          echo "========================================"
+
+          LSPATCH_URL=$(
+            curl -fsSL https://api.github.com/repos/JingMatrix/LSPatch/releases/latest |
+            jq -r '
+              .assets[]
+              | select(.name | endswith("-release.jar"))
+              | .browser_download_url
+            ' |
+            head -n 1
+          )
+
+          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+            echo "ERROR: Could not find current LSPatch release JAR."
+            exit 1
+          fi
+
           echo "LSPATCH_URL=$LSPATCH_URL"
-          wget -O lspatch.jar "$LSPATCH_URL"
 
-          MODULE_URL=$(curl -s https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases/latest | jq -r '.assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url')
+          wget -q --show-progress -O lspatch.jar "$LSPATCH_URL"
+
+          if [ ! -s lspatch.jar ]; then
+            echo "ERROR: LSPatch download failed."
+            exit 1
+          fi
+
+          ls -lh lspatch.jar
+
+          # ==========================================================
+          # Download Disable FLAG_SECURE module
+          # ==========================================================
+          echo "========================================"
+          echo "Downloading Disable FLAG_SECURE module"
+          echo "========================================"
+
+          MODULE_URL=$(
+            curl -fsSL \
+              https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases/latest |
+            jq -r '
+              .assets[]
+              | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$"))
+              | .browser_download_url
+            ' |
+            head -n 1
+          )
+
+          if [ -z "$MODULE_URL" ] || [ "$MODULE_URL" = "null" ]; then
+            echo "ERROR: Could not find Disable FLAG_SECURE module."
+            exit 1
+          fi
+
           echo "MODULE_URL=$MODULE_URL"
-          wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          APKEEP_URL=$(curl -s https://api.github.com/repos/EFForg/apkeep/releases/latest | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url')
+          wget -q --show-progress \
+            -O Xposed-Disable-FLAG_SECURE.apk \
+            "$MODULE_URL"
+
+          if [ ! -s Xposed-Disable-FLAG_SECURE.apk ]; then
+            echo "ERROR: Module download failed."
+            exit 1
+          fi
+
+          ls -lh Xposed-Disable-FLAG_SECURE.apk
+
+          # ==========================================================
+          # Download apkeep
+          # ==========================================================
+          echo "========================================"
+          echo "Downloading apkeep"
+          echo "========================================"
+
+          APKEEP_URL=$(
+            curl -fsSL https://api.github.com/repos/EFForg/apkeep/releases/latest |
+            jq -r '
+              .assets[]
+              | select(.name == "apkeep-x86_64-unknown-linux-gnu")
+              | .browser_download_url
+            ' |
+            head -n 1
+          )
+
+          if [ -z "$APKEEP_URL" ] || [ "$APKEEP_URL" = "null" ]; then
+            echo "ERROR: Could not find apkeep binary."
+            exit 1
+          fi
+
           echo "APKEEP_URL=$APKEEP_URL"
-          wget -O apkeep "$APKEEP_URL"
+
+          wget -q --show-progress -O apkeep "$APKEEP_URL"
 
           chmod +x apkeep
+
+          if [ ! -x apkeep ]; then
+            echo "ERROR: apkeep is not executable."
+            exit 1
+          fi
+
           mkdir -p apk_download
 
+          # ==========================================================
+          # Download target APK
+          # ==========================================================
+          echo "========================================"
+          echo "Downloading target APK"
+          echo "========================================"
+
           if [ -n "${{ github.event.inputs.app_id }}" ]; then
+
             SRC="${{ github.event.inputs.download_source }}"
-            echo "Using app_id with source=$SRC"
+
+            echo "Using package name:"
+            echo "${{ github.event.inputs.app_id }}"
+
+            echo "Using download source:"
+            echo "$SRC"
 
             if [ -n "$SRC" ]; then
-              ./apkeep -a "${{ github.event.inputs.app_id }}" -d "$SRC" ./apk_download
+              ./apkeep \
+                -a "${{ github.event.inputs.app_id }}" \
+                -d "$SRC" \
+                ./apk_download
             else
-              ./apkeep -a "${{ github.event.inputs.app_id }}" ./apk_download
+              ./apkeep \
+                -a "${{ github.event.inputs.app_id }}" \
+                ./apk_download
             fi
 
-            ls -la apk_download
+            echo "Downloaded files:"
+            ls -lah apk_download
 
-            FILE=$(ls apk_download | head -n 1)
-            BASENAME="${FILE%.*}"
+            FILE=$(find apk_download -maxdepth 1 -type f | head -n 1)
+
+            if [ -z "$FILE" ]; then
+              echo "ERROR: No APK file was downloaded."
+              exit 1
+            fi
+
+            FILE_NAME=$(basename "$FILE")
+            BASENAME="${FILE_NAME%.*}"
 
           elif [ -n "${{ github.event.inputs.apk_url }}" ]; then
-            echo "Using direct apk_url"
-            wget -P ./apk_download "${{ github.event.inputs.apk_url }}"
-            ls -la apk_download
+
+            echo "Using direct APK URL:"
+            echo "${{ github.event.inputs.apk_url }}"
+
+            wget -q --show-progress \
+              -P ./apk_download \
+              "${{ github.event.inputs.apk_url }}"
+
+            echo "Downloaded files:"
+            ls -lah apk_download
+
           else
-            echo "No input provided"
+
+            echo "ERROR: You must provide either app_id or apk_url."
+            exit 1
+
+          fi
+
+          if [ ! "$(find apk_download -maxdepth 1 -type f | head -n 1)" ]; then
+            echo "ERROR: apk_download is empty."
             exit 1
           fi
 
-          if [ ! "$(ls -A apk_download)" ]; then
-            echo "apk_download is empty"
-            exit 1
-          fi
+          # ==========================================================
+          # Detect APK or split APK bundle
+          # ==========================================================
+          echo "========================================"
+          echo "Checking downloaded package"
+          echo "========================================"
 
-          if ! file apk_download/* | grep -q "Android package (APK)"; then
-            APKEDITOR_URL=$(curl -s https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '.assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url')
+          file apk_download/* || true
+
+          if file apk_download/* | grep -qi "Android package (APK)"; then
+
+            echo "Single APK detected."
+
+            FIRST_APK=$(find apk_download -maxdepth 1 -type f | head -n 1)
+
+            cp "$FIRST_APK" main.apk
+
+          else
+
+            echo "APK bundle / split package detected."
+
+            # --------------------------------------------------------
+            # Download APKEditor
+            # --------------------------------------------------------
+            APKEDITOR_URL=$(
+              curl -fsSL \
+                https://api.github.com/repos/REAndroid/APKEditor/releases/latest |
+              jq -r '
+                .assets[]
+                | select(.name | test("^APKEditor-.*\\.jar$"))
+                | .browser_download_url
+              ' |
+              head -n 1
+            )
+
+            if [ -z "$APKEDITOR_URL" ] || [ "$APKEDITOR_URL" = "null" ]; then
+              echo "ERROR: Could not find APKEditor."
+              exit 1
+            fi
+
             echo "APKEDITOR_URL=$APKEDITOR_URL"
-            wget -O APKEditor.jar "$APKEDITOR_URL"
 
-            java -jar APKEditor.jar m -i apk_download/* -o main.apk
-          else
-            cp apk_download/* main.apk
+            wget -q --show-progress \
+              -O APKEditor.jar \
+              "$APKEDITOR_URL"
+
+            if [ ! -s APKEditor.jar ]; then
+              echo "ERROR: APKEditor download failed."
+              exit 1
+            fi
+
+            echo "Merging APK bundle..."
+
+            java -jar APKEditor.jar \
+              m \
+              -i apk_download/* \
+              -o main.apk
+
           fi
 
-          ls -la
+          if [ ! -s main.apk ]; then
+            echo "ERROR: main.apk was not created."
+            exit 1
+          fi
+
+          ls -lh main.apk
+
+          # ==========================================================
+          # Prepare LSPatch
+          # ==========================================================
+          echo "========================================"
+          echo "Preparing LSPatch"
+          echo "========================================"
 
           mkdir -p lspatch
 
           INJECT_FLAG=""
+
           if [ "${{ github.event.inputs.injectdex }}" = "true" ]; then
             INJECT_FLAG="--injectdex"
           fi
 
+          echo "Inject flag: $INJECT_FLAG"
+          echo "Signature bypass level: ${{ github.event.inputs.signature_bypass }}"
+
+          # ==========================================================
+          # Patch APK
+          # ==========================================================
+          echo "========================================"
+          echo "Patching APK"
+          echo "========================================"
+
           java -jar lspatch.jar \
-            -l ${{ github.event.inputs.signture_bypass }} \
+            -l "${{ github.event.inputs.signature_bypass }}" \
             -m Xposed-Disable-FLAG_SECURE.apk \
             $INJECT_FLAG \
-            -o lspatch main.apk
+            -o lspatch \
+            main.apk
 
-          ls -la lspatch
+          echo "LSPatch output:"
+          ls -lah lspatch
 
-          mkdir -p output
+          # ==========================================================
+          # Find patched APK
+          # ==========================================================
+          echo "========================================"
+          echo "Preparing output"
+          echo "========================================"
 
-          mv lspatch/* "lspatch/${BASENAME}.apk"
+          PATCHED_FILE=$(find lspatch -maxdepth 1 -type f -name "*.apk" | head -n 1)
 
+          if [ -z "$PATCHED_FILE" ]; then
+            echo "ERROR: LSPatch did not produce a patched APK."
+            exit 1
+          fi
+
+          FINAL_APK="lspatch/${BASENAME}.apk"
+
+          if [ "$PATCHED_FILE" != "$FINAL_APK" ]; then
+            mv "$PATCHED_FILE" "$FINAL_APK"
+          fi
+
+          echo "Final patched APK:"
+          ls -lh "$FINAL_APK"
+
+          echo "========================================"
+          echo "Build completed successfully"
+          echo "========================================"
+
+      # ============================================================
+      # Upload patched APK
+      # ============================================================
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
         with:
           name: patched-apk
-          path: "lspatch/*"
+          path: "lspatch/*.apk"
+          if-no-files-found: error
